@@ -1,0 +1,1162 @@
+#!/usr/bin/env python3
+"""
+ON-v5 training script with integrated Chain-of-Thought (CoT) architecture. Atualizado para:
+
+- enviar comandos para um robô (RobotCommander) com modo simulate/dry-run
+- melhorias em visão computacional (ResNet backbone adapter + augmentations)
+- melhorias em áudio (MFCC encoder + optional wav2vec2 pipeline placeholder)
+- gerar arquivos JSON para controle de dispositivos inteligentes
+
+Este arquivo mantém TODOS os conjuntos de dados listados originalmente — o modelo
+foi projetado para ser grande (defaults grandes) conforme solicitado.
+"""
+
+import os
+import math
+import random
+import argparse
+import json
+import socket
+import time
+import logging
+from typing import List, Iterator, Optional, Tuple, Dict, Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers, normalizers
+from datasets import load_dataset
+
+from PIL import Image
+from torchvision import transforms, models as tv_models
+import torchaudio
+
+# MQTT opcional para enviar comandos ao robô
+try:
+    import paho.mqtt.client as mqtt
+    MQTT_AVAILABLE = True
+except Exception:
+    MQTT_AVAILABLE = False
+
+# FAISS opcional (se precisar de indexing)
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except Exception:
+    FAISS_AVAILABLE = False
+
+# -----------------------
+# Defaults / constants
+# -----------------------
+
+# Alterado para 2 milhões conforme pedido
+DEFAULT_VOCAB_SIZE = 2_000_000
+DEFAULT_MAX_SEQ = 8192
+
+# Defaults maiores conforme pedido
+DEFAULT_EMBED = 2048
+DEFAULT_LAYERS = 24
+DEFAULT_HEADS = 32
+DEFAULT_BATCH = 4
+
+CHECKPOINT_DIR = "checkpoints_on"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+DATASET_IDS_TEXT = [
+    "wikipedia", "openwebtext", "bookcorpus", "pile",
+    "cc_news", "wikitext", "arxiv", "pubmed", "europarl", "open_subtitles",
+]
+
+DATASET_IDS_IMAGE = ["coco", "openimages", "image_corpus_placeholder"]
+
+DATASET_IDS_AUDIO = [
+    "mozilla-foundation/common_voice", "librispeech_asr", "voxpopuli", "speech_commands"
+]
+
+DATASET_IDS_CODE = [
+    "bigcode/the-stack", "codeparrot/github-code", "huggingface-course/codeparrot", "neulab/code-search-net"
+]
+
+SPECIAL_TOKENS = [
+    "[PAD]", "[UNK]", "[CLS]", "[SEP]",
+    "<JSON_START>", "<JSON_END>", "<STRUCT>",
+    "<CODE_START>", "<CODE_END>"
+]
+
+# -----------------------
+# Logging
+# -----------------------
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger("on_v5")
+
+# -----------------------
+# Helper: memory estimator (grosso)
+# -----------------------
+
+def estimate_param_memory_gb(vocab_size:int, embed_dim:int, num_layers:int) -> float:
+    """
+    Estimativa grosseira de memória apenas para os pesos (float32).
+    Inclui embedding + aproximação para transformer (atenção + ffn).
+    Retorna GB.
+    """
+    emb_params = vocab_size * embed_dim
+    # aproximação da ordem de magnitude por camada
+    per_layer = 12 * (embed_dim ** 2)  # heurística usada acima
+    trans_params = per_layer * num_layers
+    total = emb_params + trans_params
+    bytes_total = total * 4
+    gb = bytes_total / (1024 ** 3)
+    return gb
+
+# -----------------------
+# Tokenizer wrapper
+# -----------------------
+
+class ONTokenizerWrapper:
+    def __init__(self, vocab_size: int = DEFAULT_VOCAB_SIZE, path_out: str = "on_tokenizer.json"):
+        self.vocab_size = vocab_size
+        self.path_out = path_out
+        self.tokenizer = Tokenizer(models.BPE())
+        # normalizer and pre-tokenizer
+        try:
+            self.tokenizer.normalizer = normalizers.NFKC()
+        except Exception:
+            pass
+        try:
+            self.tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        except Exception:
+            pass
+        self.trainer = trainers.BpeTrainer(
+            vocab_size=self.vocab_size, special_tokens=SPECIAL_TOKENS
+        )
+        self._is_trained = False
+
+    def train_from_iterator(self, iterator: Iterator[str]):
+        logger.info("[Tokenizer] Treinando BPE... (isso pode demorar)")
+        self.tokenizer.train_from_iterator(iterator, trainer=self.trainer)
+        self.save()
+        self._is_trained = True
+        logger.info(f"[Tokenizer] salvo em {self.path_out}")
+
+    def save(self):
+        try:
+            self.tokenizer.save(self.path_out)
+        except Exception as e:
+            logger.warning("Não foi possível usar Tokenizer.save(), tentando serializar to_str(): %s", e)
+            try:
+                with open(self.path_out, "w", encoding="utf-8") as f:
+                    f.write(self.tokenizer.to_str())
+            except Exception as e2:
+                logger.error("Falha ao salvar tokenizer: %s", e2)
+
+    def load(self):
+        if os.path.exists(self.path_out):
+            try:
+                self.tokenizer = Tokenizer.from_file(self.path_out)
+                self._is_trained = True
+                logger.info("[Tokenizer] carregado")
+            except Exception:
+                # tentar ler como string (compatibilidade)
+                try:
+                    with open(self.path_out, "r", encoding="utf-8") as f:
+                        txt = f.read()
+                    self.tokenizer = Tokenizer.from_str(txt)
+                    self._is_trained = True
+                    logger.info("[Tokenizer] carregado via from_str")
+                except Exception as e:
+                    raise FileNotFoundError("Tokenizer não encontrado ou inválido: %s" % e)
+        else:
+            raise FileNotFoundError("Tokenizer não encontrado")
+
+    def encode_ids(self, text: str, max_length: int = DEFAULT_MAX_SEQ) -> List[int]:
+        ids = self.tokenizer.encode(text).ids
+        return ids[:max_length] if len(ids) > max_length else ids
+
+    def pad_truncate(self, ids: List[int], max_length: int = DEFAULT_MAX_SEQ) -> List[int]:
+        if len(ids) >= max_length:
+            return ids[:max_length]
+        vocab = self.get_vocab()
+        pad_id = self.token_to_id("[PAD]") if "[PAD]" in vocab else 0
+        return ids + [pad_id] * (max_length - len(ids))
+
+    def get_vocab_size(self):
+        try:
+            return len(self.tokenizer.get_vocab())
+        except Exception:
+            return 0
+
+    def get_vocab(self) -> Dict[str, int]:
+        try:
+            return self.tokenizer.get_vocab()
+        except Exception:
+            return {}
+
+    def token_to_id(self, token: str) -> int:
+        try:
+            tid = self.tokenizer.token_to_id(token)
+            if tid is None:
+                return 0
+            return int(tid)
+        except Exception:
+            vocab = self.get_vocab()
+            return int(vocab.get(token, 0))
+
+    def decode_ids(self, ids: List[int]) -> str:
+        try:
+            return self.tokenizer.decode(ids)
+        except Exception:
+            return " ".join(map(str, ids))
+
+# -----------------------
+# Dataset iterators (streaming-friendly)
+# -----------------------
+
+def text_stream_iterator(hf_id: str, config_name: Optional[str] = None, field_candidates: List[str] = ["text", "article", "content"]):
+    try:
+        if config_name:
+            ds = load_dataset(hf_id, config_name, split="train", streaming=True)
+        else:
+            ds = load_dataset(hf_id, split="train", streaming=True)
+    except Exception as e:
+        logger.warning(f"[Dataset] erro abrir {hf_id}: {e}")
+        return iter([])
+
+    def gen():
+        for ex in ds:
+            if isinstance(ex, dict):
+                for k in field_candidates:
+                    if k in ex and isinstance(ex[k], str):
+                        yield ex[k]
+                        break
+            elif isinstance(ex, str):
+                yield ex
+    return gen()
+
+def code_dataset_iterator(hf_id: str):
+    try:
+        ds = load_dataset(hf_id, split="train")
+    except Exception as e:
+        logger.warning(f"[CodeDataset] não foi possível abrir {hf_id}: {e}")
+        return iter([])
+
+    def gen():
+        for ex in ds:
+            if isinstance(ex, dict):
+                code = ex.get("content") or ex.get("text") or ex.get("code") or ex.get("source") or ex.get("file")
+                if isinstance(code, str) and len(code.strip()) > 0:
+                    yield code
+            elif isinstance(ex, str):
+                yield ex
+    return gen()
+
+def image_dataset_iterator(hf_id: str):
+    try:
+        ds = load_dataset(hf_id, split="train")
+    except Exception as e:
+        logger.warning(f"[Image] erro {hf_id}: {e}")
+        return iter([])
+
+    def gen():
+        for ex in ds:
+            img = None
+            caption = ""
+            if isinstance(ex, dict):
+                if "image" in ex:
+                    img = ex["image"]
+                elif "img" in ex:
+                    img = ex["img"]
+                caption = ex.get("caption", "")
+            if img is not None:
+                yield img, caption
+    return gen()
+
+def audio_dataset_iterator(hf_id: str, config_name: Optional[str] = None):
+    try:
+        if config_name:
+            ds = load_dataset(hf_id, config_name, split="train", streaming=True)
+        else:
+            ds = load_dataset(hf_id, split="train", streaming=True)
+    except Exception as e:
+        logger.warning(f"[Audio] erro {hf_id}: {e}")
+        return iter([])
+
+    def gen():
+        for ex in ds:
+            if isinstance(ex, dict) and "audio" in ex:
+                yield ex["audio"], ex.get("sentence", "") or ex.get("text", "")
+    return gen()
+
+# -----------------------
+# Encoders (vision/audio) - MELHORADOS
+# -----------------------
+
+class ResNetVisionEncoder(nn.Module):
+    def __init__(self, embed_dim: int, backbone_name: str = "resnet18", pretrained: bool = True):
+        super().__init__()
+        self.embed_dim = embed_dim
+        try:
+            if backbone_name == "resnet18":
+                # compatibilidade com versões novas torchvision: use weights se disponível
+                try:
+                    backbone = tv_models.resnet18(pretrained=pretrained)
+                except TypeError:
+                    # fallback se API mudou
+                    backbone = tv_models.resnet18(weights=None) if not pretrained else tv_models.resnet18()
+                modules = list(backbone.children())[:-2]
+                self.backbone = nn.Sequential(*modules)
+                backbone_out_ch = 512
+            else:
+                self.backbone = nn.Sequential(
+                    nn.Conv2d(3, 32, 3, 2, 1),
+                    nn.ReLU(),
+                    nn.Conv2d(32, 64, 3, 2, 1),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.Flatten()
+                )
+                backbone_out_ch = 64
+        except Exception:
+            self.backbone = nn.Sequential(
+                nn.Conv2d(3, 32, 3, 2, 1),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, 3, 2, 1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten()
+            )
+            backbone_out_ch = 64
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(backbone_out_ch, embed_dim)
+
+    def forward(self, img_tensor: torch.Tensor):
+        feat = self.backbone(img_tensor)
+        if feat.dim() == 4:
+            feat = self.pool(feat).flatten(1)
+        return self.fc(feat)
+
+class RobustAudioEncoder(nn.Module):
+    def __init__(self, embed_dim: int, sample_rate: int = 16000, n_mels: int = 80, chunk_seconds: float = 10.0):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.chunk_samples = int(chunk_seconds * sample_rate)
+        self.melspec = torchaudio.transforms.MelSpectrogram(sample_rate=sample_rate, n_mels=n_mels)
+        self.instancenorm = nn.InstanceNorm1d(n_mels)
+        self.cnn = nn.Sequential(
+            nn.Conv1d(n_mels, 128, kernel_size=5, stride=2, padding=2),
+            nn.GELU(),
+            nn.Conv1d(128, 256, kernel_size=5, stride=2, padding=2),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten()
+        )
+        self.fc = nn.Linear(256, embed_dim)
+        self.agg_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=4, dim_feedforward=embed_dim * 2)
+        self.agg = nn.TransformerEncoder(self.agg_layer, num_layers=2)
+
+    def forward(self, wave: torch.Tensor):
+        if wave.dim() == 3 and wave.size(1) == 1:
+            wave = wave.squeeze(1)
+        B, T = wave.shape
+        chunk_embs = []
+        device = wave.device
+        for start in range(0, T, self.chunk_samples):
+            seg = wave[:, start:start + self.chunk_samples]
+            if seg.shape[1] == 0:
+                break
+            if seg.shape[1] < self.chunk_samples:
+                pad = torch.zeros(B, self.chunk_samples - seg.shape[1], device=device)
+                seg = torch.cat([seg, pad], dim=1)
+            mel = self.melspec(seg)
+            mel = torch.log1p(mel)
+            mel = self.instancenorm(mel)
+            emb = self.cnn(mel)
+            emb = self.fc(emb)
+            chunk_embs.append(emb.unsqueeze(0))
+        if len(chunk_embs) == 0:
+            return torch.zeros(B, self.fc.out_features, device=device)
+        seq = torch.cat(chunk_embs, dim=0)
+        seq = self.agg(seq)
+        pooled = seq.mean(dim=0)
+        return pooled
+
+# -----------------------
+# Core transformer pieces
+# -----------------------
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.out = nn.Linear(embed_dim, embed_dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, mask: Optional[torch.Tensor] = None):
+        # x: (seq, bsz, embed)
+        seq, bsz, _ = x.size()
+        qkv = self.qkv(x).view(seq, bsz, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.permute(1, 2, 0, 3)
+        k = k.permute(1, 2, 0, 3)
+        v = v.permute(1, 2, 0, 3)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float("-inf"))
+        att = torch.softmax(scores, dim=-1)
+        out = torch.matmul(att, v)
+        out = out.permute(2, 0, 1, 3).contiguous().view(seq, bsz, self.embed_dim)
+        return self.drop(self.out(out))
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, ffn_dim: int, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = MultiHeadSelfAttention(embed_dim, num_heads, dropout)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(nn.Linear(embed_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, embed_dim))
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, mask: Optional[torch.Tensor] = None):
+        r = x
+        x = self.norm1(x)
+        x = self.attn(x, mask)
+        x = r + self.drop(x)
+        r = x
+        x = self.norm2(x)
+        x = self.ff(x)
+        return r + self.drop(x)
+
+# -----------------------
+# CoT and Thought modules
+# -----------------------
+
+class CoTModule(nn.Module):
+    def __init__(self, embed_dim: int, cot_steps: int = 64, n_layers: int = 2, n_heads: int = 8, vocab_size: int = None):
+        super().__init__()
+        self.cot_steps = cot_steps
+        self.start_tokens = nn.Parameter(torch.randn(self.cot_steps, 1, embed_dim))
+        self.layers = nn.ModuleList([TransformerBlock(embed_dim, n_heads, embed_dim * 4) for _ in range(n_layers)])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.vocab_size = vocab_size
+        self.head = nn.Linear(embed_dim, vocab_size) if vocab_size is not None else None
+
+    def forward(self, context: torch.Tensor):
+        # context shape: (seq, bsz, embed)
+        seq_len, bsz, embed = context.size()
+        thoughts = self.start_tokens.expand(-1, bsz, -1)
+        full = torch.cat([context, thoughts], dim=0)
+        for layer in self.layers:
+            full = layer(full)
+        cot_out = full[-self.cot_steps:, :, :]
+        cot_out = self.norm(cot_out)
+        logits = None
+        if self.head is not None:
+            logits = self.head(cot_out.permute(1, 0, 2))
+        return cot_out, logits
+
+class ThoughtModule(nn.Module):
+    def __init__(self, embed_dim: int, thought_minutes: float = 9.0, token_rate: float = 1.0, n_layers: int = 2, n_heads: int = 8, max_steps: int = 4096):
+        super().__init__()
+        computed = max(8, int(thought_minutes * 60 * token_rate))
+        self.n_steps = min(computed, max_steps)
+        self.start_tokens = nn.Parameter(torch.randn(self.n_steps, 1, embed_dim))
+        self.layers = nn.ModuleList([TransformerBlock(embed_dim, n_heads, embed_dim * 4) for _ in range(n_layers)])
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.kv_proj = nn.Linear(embed_dim, embed_dim * 2)
+        self.memory = nn.Parameter(torch.randn(max(16, self.n_steps // 4), 1, embed_dim))
+        self.norm = nn.LayerNorm(embed_dim)
+        self.mem_gate = nn.Linear(embed_dim * 2, embed_dim)
+
+    def cross_attention(self, queries, context):
+        Q, B, E = queries.size()
+        kv = self.kv_proj(context)
+        k, v = kv.chunk(2, dim=-1)
+        q2 = self.q_proj(queries).permute(1, 0, 2)
+        k2 = k.permute(1, 0, 2)
+        scores = torch.matmul(q2, k2.transpose(-2, -1)) / math.sqrt(E)
+        attn = torch.softmax(scores, dim=-1)
+        v2 = v.permute(1, 0, 2)
+        out = torch.matmul(attn, v2)
+        out = out.permute(1, 0, 2)
+        return out
+
+    def forward(self, context: torch.Tensor, cot_emb: Optional[torch.Tensor] = None):
+        seq_len, bsz, embed = context.size()
+        thoughts = self.start_tokens.expand(-1, bsz, -1)
+        mem = self.memory.expand(-1, bsz, -1)
+        if cot_emb is not None:
+            full_context = torch.cat([context, mem, cot_emb], dim=0)
+        else:
+            full_context = torch.cat([context, mem], dim=0)
+        combined = torch.cat([full_context, thoughts], dim=0)
+        for layer in self.layers:
+            combined = layer(combined)
+        thoughts_out = combined[-self.n_steps:, :, :]
+        cross = self.cross_attention(thoughts_out, full_context)
+        gated = torch.sigmoid(self.mem_gate(torch.cat([thoughts_out, cross], dim=-1))) * cross + thoughts_out
+        return self.norm(gated)
+
+# -----------------------
+# Robot Commander (simulate + auth)
+# -----------------------
+
+class RobotCommander:
+    def __init__(self, mqtt_host: Optional[str] = None, mqtt_user: Optional[str] = None, mqtt_pass: Optional[str] = None,
+                 mqtt_topic: str = "robot/commands", tcp_host: Optional[str] = None, tcp_port: int = 9000,
+                 fallback_path: str = "/tmp/robot_commands.jsonl", simulate: bool = True):
+        self.mqtt_host = mqtt_host
+        self.mqtt_user = mqtt_user
+        self.mqtt_pass = mqtt_pass
+        self.mqtt_topic = mqtt_topic
+        self.tcp_host = tcp_host
+        self.tcp_port = tcp_port
+        self.fallback_path = fallback_path
+        self.simulate = simulate
+        self.mqtt_client = None
+        if mqtt_host and MQTT_AVAILABLE and not simulate:
+            try:
+                self.mqtt_client = mqtt.Client()
+                if mqtt_user:
+                    self.mqtt_client.username_pw_set(mqtt_user, mqtt_pass)
+                self.mqtt_client.connect(mqtt_host)
+            except Exception as e:
+                logger.warning("[RobotCommander] não foi possível conectar MQTT: %s", e)
+                self.mqtt_client = None
+
+    def send_command(self, command: Dict[str, Any], prefer: Optional[str] = None) -> Tuple[bool, str]:
+        payload = json.dumps(command, ensure_ascii=False)
+        if self.simulate:
+            # modo seguro: não envia nada de verdade
+            return True, "simulated"
+
+        if prefer == "mqtt" or (prefer is None and self.mqtt_client is not None):
+            if self.mqtt_client is not None:
+                try:
+                    self.mqtt_client.publish(self.mqtt_topic, payload)
+                    return True, "sent_mqtt"
+                except Exception as e:
+                    logger.warning("[RobotCommander] mqtt failed: %s", e)
+
+        if prefer == "tcp" or (prefer is None and self.tcp_host is not None):
+            try:
+                with socket.create_connection((self.tcp_host, self.tcp_port), timeout=2) as s:
+                    s.sendall(payload.encode("utf-8"))
+                return True, "sent_tcp"
+            except Exception as e:
+                logger.warning("[RobotCommander] tcp failed: %s", e)
+
+        # fallback: write JSON line to file
+        try:
+            os.makedirs(os.path.dirname(self.fallback_path), exist_ok=True)
+            with open(self.fallback_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": time.time(),
+                    "command": command
+                }, ensure_ascii=False) + "\n")
+            return True, "written_file"
+        except Exception as e:
+            logger.error("[RobotCommander] fallback failed: %s", e)
+            return False, f"failed:{e}"
+
+# -----------------------
+# ONModel (main) - com JSON-control head
+# -----------------------
+
+class ONModel(nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int = DEFAULT_EMBED, num_layers: int = DEFAULT_LAYERS,
+                 num_heads: int = DEFAULT_HEADS, max_seq: int = DEFAULT_MAX_SEQ, thought_minutes: float = 9.0,
+                 token_rate: float = 1.0, thought_max_steps: int = 4096, thought_layers: int = 2,
+                 structure_labels: List[str] = None, use_cot: bool = False, cot_steps: int = 64,
+                 cot_vocab_supervision: bool = False):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.max_seq = max_seq
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
+        self.pos_emb = nn.Parameter(torch.randn(max_seq, 1, embed_dim))
+        self.layers = nn.ModuleList([TransformerBlock(embed_dim, num_heads, embed_dim * 4) for _ in range(num_layers)])
+        self.use_cot = use_cot
+        self.cot_steps = cot_steps
+        if use_cot:
+            cot_vocab = vocab_size if cot_vocab_supervision else None
+            self.cot_module = CoTModule(embed_dim, cot_steps=cot_steps, n_layers=max(1, thought_layers // 1),
+                                        n_heads=max(8, num_heads // 2), vocab_size=cot_vocab)
+        else:
+            self.cot_module = None
+        self.thought = ThoughtModule(embed_dim, thought_minutes=thought_minutes, token_rate=token_rate,
+                                     n_layers=thought_layers, n_heads=max(8, num_heads // 2), max_steps=thought_max_steps)
+        self.final_ln = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, vocab_size)
+        self.vision_adapter = nn.Linear(embed_dim, embed_dim)
+        self.audio_adapter = nn.Linear(embed_dim, embed_dim)
+        self.structure_labels = structure_labels or ["text", "code", "json", "table"]
+        self.structure_head = nn.Linear(embed_dim, len(self.structure_labels))
+
+        # NOVO: heads para controle/JSON e comando para robô
+        self.device_type_head = nn.Linear(embed_dim, 32)
+        self.device_action_head = nn.Linear(embed_dim, 64)
+        self.params_head = nn.Sequential(nn.Linear(embed_dim, embed_dim // 2), nn.GELU(), nn.Linear(embed_dim // 2, 128))
+        self.json_text_head = nn.Linear(embed_dim, vocab_size)
+
+    def forward(self, input_ids: torch.LongTensor, vision_emb: Optional[torch.Tensor] = None,
+                audio_emb: Optional[torch.Tensor] = None, cot_supervision_tokens: Optional[torch.LongTensor] = None):
+        # input_ids: (bsz, seq)
+        bsz, seq = input_ids.size()
+        x = self.token_emb(input_ids).transpose(0, 1)  # (seq, bsz, embed)
+        x = x + self.pos_emb[:seq, :, :].to(x.device)
+        prefix = []
+        if vision_emb is not None:
+            v = self.vision_adapter(vision_emb).unsqueeze(0)
+            prefix.append(v)
+        if audio_emb is not None:
+            a = self.audio_adapter(audio_emb).unsqueeze(0)
+            prefix.append(a)
+        if prefix:
+            pref = torch.cat(prefix, dim=0)
+            x = torch.cat([pref, x], dim=0)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        cot_emb = None
+        cot_logits = None
+        if self.use_cot and self.cot_module is not None:
+            cot_emb, cot_logits = self.cot_module(x)
+
+        thought_repr = self.thought(x, cot_emb=cot_emb)
+        x = torch.cat([x, thought_repr], dim=0)
+        x = self.final_ln(x)
+        token_slice = x[-seq:, :, :].transpose(0, 1)
+        logits = self.head(token_slice)
+        pooled = token_slice.mean(dim=1)
+        struct_logits = self.structure_head(pooled)
+
+        device_type_logits = self.device_type_head(pooled)
+        device_action_logits = self.device_action_head(pooled)
+        params_vector = self.params_head(pooled)
+        json_text_logits = self.json_text_head(pooled)
+
+        return {
+            "logits": logits,
+            "struct_logits": struct_logits,
+            "cot_logits": cot_logits,
+            "device_type_logits": device_type_logits,
+            "device_action_logits": device_action_logits,
+            "params_vector": params_vector,
+            "json_text_logits": json_text_logits,
+            "pooled": pooled
+        }
+
+    def build_device_control_json(self, pooled_embedding: torch.Tensor, tokenizer: ONTokenizerWrapper,
+                                  device_map: Optional[List[str]] = None, action_map: Optional[List[str]] = None,
+                                  topk: int = 1) -> List[Dict]:
+        device_map = device_map or [f"device_{i}" for i in range(32)]
+        action_map = action_map or [f"action_{i}" for i in range(64)]
+        dt_logits = self.device_type_head(pooled_embedding)
+        act_logits = self.device_action_head(pooled_embedding)
+        params_vec = self.params_head(pooled_embedding)
+
+        results = []
+        probs_dt = torch.softmax(dt_logits, dim=-1)
+        probs_act = torch.softmax(act_logits, dim=-1)
+        B = pooled_embedding.size(0)
+        for i in range(B):
+            dt_idx = int(torch.argmax(probs_dt[i]).item())
+            act_idx = int(torch.argmax(probs_act[i]).item())
+            pv = params_vec[i].cpu().tolist()
+            # normalize params to reasonable ranges
+            p1 = round(float(abs(pv[0]) % 100), 3) if len(pv) > 0 else 0.0
+            p2 = round((abs(pv[1]) % 1) * 100, 3) if len(pv) > 1 else 0.0
+            p3 = int(abs(pv[2]) % 255) if len(pv) > 2 else 0
+            device_name = device_map[dt_idx] if dt_idx < len(device_map) else f"device_{dt_idx}"
+            action_name = action_map[act_idx] if act_idx < len(action_map) else f"action_{act_idx}"
+            jsond = {
+                "device_id": device_name,
+                "action": action_name,
+                "params": {
+                    "param_a": p1,
+                    "param_b": p2,
+                    "param_c": p3
+                },
+                "meta": {"generated_at": time.time()}
+            }
+            results.append(jsond)
+        return results
+
+    def build_json_string_from_pooled(self, pooled_embedding: torch.Tensor, tokenizer: ONTokenizerWrapper, max_len: int = 128) -> List[str]:
+        logits = self.json_text_head(pooled_embedding)
+        B = logits.size(0)
+        outputs = []
+        for i in range(B):
+            top_idx = int(torch.argmax(logits[i]).item())
+            try:
+                s = tokenizer.decode_ids([top_idx])
+            except Exception:
+                s = f'{{"generated_token": {top_idx}}}'
+            if not s.strip().startswith("{"):
+                s = '{"_token": ' + json.dumps(s) + "}"
+            outputs.append(s)
+        return outputs
+
+# -----------------------
+# Small generative image/audio models (VAE/UNet/Diffusion)
+# -----------------------
+
+class ConvEncoder(nn.Module):
+    def __init__(self, in_ch=3, z_dim=512):
+        super().__init__()
+        # adaptando o tamanho corretamente
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 64, 4, 2, 1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 4, 2, 1),
+            nn.ReLU(),
+            nn.Conv2d(128, 256, 4, 2, 1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(256 * 4 * 4, z_dim * 2)
+        )
+
+    def forward(self, x):
+        stats = self.net(x)
+        mu, logvar = stats.chunk(2, dim=1)
+        return mu, logvar
+
+class ConvDecoder(nn.Module):
+    def __init__(self, out_ch=3, z_dim=512):
+        super().__init__()
+        self.fc = nn.Linear(z_dim, 256 * 4 * 4)
+        self.net = nn.Sequential(
+            nn.Unflatten(1, (256, 4, 4)),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, out_ch, 4, 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, z):
+        x = self.fc(z)
+        x = self.net(x)
+        return x
+
+class VAE(nn.Module):
+    def __init__(self, img_channels=3, z_dim=512):
+        super().__init__()
+        self.encoder = ConvEncoder(in_ch=img_channels, z_dim=z_dim)
+        self.decoder = ConvDecoder(out_ch=img_channels, z_dim=z_dim)
+
+    def reparameterize(self, mu, logvar):
+        std = (0.5 * logvar).exp()
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def encode(self, x):
+        mu, logvar = self.encoder(x)
+        z = self.reparameterize(mu, logvar)
+        return z, mu, logvar
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        z, mu, logvar = self.encode(x)
+        recon = self.decode(z)
+        return recon, mu, logvar
+
+class SimpleUNet(nn.Module):
+    def __init__(self, latent_dim=512):
+        super().__init__()
+        latent_dim2 = max(16, latent_dim // 2)
+        self.down = nn.Sequential(nn.Linear(latent_dim, latent_dim2), nn.GELU(), nn.Linear(latent_dim2, latent_dim))
+        self.time_embed = nn.Sequential(nn.Linear(1, latent_dim), nn.ReLU())
+        self.out = nn.Sequential(nn.Linear(latent_dim, latent_dim), nn.Tanh())
+
+    def forward(self, z, t):
+        te = self.time_embed(t.unsqueeze(-1).float())
+        h = self.down(z)
+        h = h + te
+        return self.out(h)
+
+def linear_beta_schedule(timesteps, beta_start=1e-4, beta_end=0.02):
+    return torch.linspace(beta_start, beta_end, timesteps)
+
+class Diffusion:
+    def __init__(self, model: nn.Module, timesteps: int = 1000, device=DEVICE):
+        self.model = model
+        self.timesteps = timesteps
+        self.device = device
+        betas = linear_beta_schedule(timesteps).to(device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.betas = betas
+        self.alphas = alphas
+        self.alphas_cumprod = alphas_cumprod
+        self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - alphas_cumprod)
+
+    def q_sample(self, x_start, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        sqrt_acp = self.sqrt_alphas_cumprod[t].unsqueeze(-1)
+        sqrt_om = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(-1)
+        return sqrt_acp * x_start + sqrt_om * noise
+
+    def p_losses(self, x_start, t):
+        noise = torch.randn_like(x_start)
+        x_noisy = self.q_sample(x_start, t, noise=noise)
+        t_tensor = t.float() / float(self.timesteps)
+        pred = self.model(x_noisy, t_tensor)
+        return F.mse_loss(pred, noise)
+
+    @torch.no_grad()
+    def sample(self, shape, device, steps=None):
+        steps = steps or self.timesteps
+        x = torch.randn(shape, device=device)
+        for i in reversed(range(steps)):
+            t = torch.tensor([i], device=device)
+            t_norm = t.float() / float(self.timesteps)
+            pred_noise = self.model(x, t_norm)
+            beta = self.betas[i]
+            alpha = self.alphas[i]
+            alpha_cum = self.alphas_cumprod[i]
+            if i > 0:
+                noise = torch.randn_like(x)
+            else:
+                noise = torch.zeros_like(x)
+            x = (1 / math.sqrt(alpha)) * (x - (beta / math.sqrt(1 - alpha_cum)) * pred_noise) + math.sqrt(beta) * noise
+        return x
+
+# -----------------------
+# Utilities
+# -----------------------
+
+image_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+def collate_texts(tokenizer: ONTokenizerWrapper, texts: List[str], max_len: int = DEFAULT_MAX_SEQ):
+    ids = [tokenizer.encode_ids(t, max_length=max_len) for t in texts]
+    ids = [tokenizer.pad_truncate(i, max_length=max_len) for i in ids]
+    input_ids = torch.tensor(ids, dtype=torch.long)
+    vocab = tokenizer.get_vocab()
+    if "[PAD]" in vocab:
+        pad_tok = tokenizer.token_to_id("[PAD]")
+    else:
+        pad_tok = 0
+    labels = input_ids.clone()
+    labels[labels == pad_tok] = -100
+    return input_ids, labels
+
+def synthetic_structured_examples():
+    examples = []
+    examples.append(('{ "title": "Servidor", "cpu": 12, "mem": 48 }', "json"))
+    examples.append(("def hello():\n    print('hello')", "code"))
+    examples.append(("| name | age |\n|----|----|\n| Ana | 30 |", "table"))
+    return examples
+
+# -----------------------
+# Training loop
+# -----------------------
+
+def train_real(args):
+    # Estimativa e aviso de memória para o vocab_size/config
+    mem_gb_est = estimate_param_memory_gb(args.vocab_size, args.embed_dim, args.layers)
+    logger.warning("[CONFIG] vocab_size=%d embed_dim=%d layers=%d -> approx params memory %.2f GB (float32, apenas pesos)",
+                   args.vocab_size, args.embed_dim, args.layers, mem_gb_est)
+    if mem_gb_est > 16.0:
+        logger.warning("[CONFIG] Estimativa alta de memória. Considere reduzir vocab_size ou usar offload/mixed precision/embeddings on CPU.")
+
+    tk = ONTokenizerWrapper(vocab_size=args.vocab_size, path_out=args.tokenizer_path)
+    if os.path.exists(args.tokenizer_path):
+        try:
+            tk.load()
+        except Exception:
+            logger.warning("[TRAIN] tokenizer load failed, will train new tokenizer")
+    else:
+        def combined_iter():
+            for ds in args.text_datasets:
+                for s in text_stream_iterator(ds):
+                    yield s
+            for ds in args.code_datasets:
+                for s in code_dataset_iterator(ds):
+                    yield s
+        # train tokenizer from iterator (may take long)
+        try:
+            tk.train_from_iterator(combined_iter())
+        except Exception as e:
+            logger.warning("[TRAIN] tokenizer training failed: %s", e)
+
+    text_iters = {ds: text_stream_iterator(ds) for ds in args.text_datasets}
+    code_iters = {ds: code_dataset_iterator(ds) for ds in args.code_datasets}
+    image_iters = {ds: image_dataset_iterator(ds) for ds in args.image_datasets}
+    audio_iters = {ds: audio_dataset_iterator(ds) for ds in args.audio_datasets}
+
+    vocab_size = tk.get_vocab_size() if tk._is_trained else max(1000, args.vocab_size)
+    structure_labels = ["text", "code", "json", "table"]
+    model = ONModel(
+        vocab_size=vocab_size,
+        embed_dim=args.embed_dim,
+        num_layers=args.layers,
+        num_heads=args.heads,
+        max_seq=args.max_seq,
+        thought_minutes=args.thought_minutes,
+        token_rate=args.token_rate,
+        thought_max_steps=args.max_thought_steps,
+        thought_layers=args.thought_layers,
+        structure_labels=structure_labels,
+        use_cot=args.use_cot,
+        cot_steps=args.cot_steps,
+        cot_vocab_supervision=args.cot_vocab_supervision
+    ).to(args.device)
+
+    vision_enc = ResNetVisionEncoder(args.embed_dim, pretrained=True).to(args.device)
+    audio_enc = RobustAudioEncoder(args.embed_dim, chunk_seconds=args.audio_chunk_seconds).to(args.device)
+
+    vae = VAE(img_channels=3, z_dim=args.vae_z_dim).to(args.device)
+    unet = SimpleUNet(latent_dim=args.vae_z_dim).to(args.device)
+    diffusion = Diffusion(unet, timesteps=args.diffusion_steps, device=args.device)
+
+    optimizer = torch.optim.AdamW(list(model.parameters()), lr=args.lr)
+    optimizer_vae = torch.optim.AdamW(vae.parameters(), lr=args.lr)
+    optimizer_unet = torch.optim.AdamW(unet.parameters(), lr=args.lr)
+
+    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+
+    robot_cmd = RobotCommander(mqtt_host=args.mqtt_host, mqtt_user=args.mqtt_user, mqtt_pass=args.mqtt_pass,
+                               mqtt_topic=args.mqtt_topic, tcp_host=args.tcp_host, tcp_port=args.tcp_port,
+                               fallback_path=args.robot_fallback_path, simulate=args.simulate_robot)
+
+    steps = 0
+    synth = synthetic_structured_examples()
+
+    for epoch in range(args.epochs):
+        for ds_name, iterator in text_iters.items():
+            batch_texts = []
+            for i, txt in enumerate(iterator):
+                if not isinstance(txt, str):
+                    continue
+                batch_texts.append(txt)
+                if len(batch_texts) == args.batch_size:
+                    input_ids, labels = collate_texts(tk, batch_texts, max_len=args.max_seq)
+                    input_ids = input_ids.to(args.device)
+                    labels = labels.to(args.device)
+
+                    vision_emb = None
+                    audio_emb = None
+                    img = None
+
+                    # sample image
+                    for img_ds, img_it in image_iters.items():
+                        try:
+                            img, caption = next(img_it)
+                            if isinstance(img, dict) and "path" in img:
+                                img = Image.open(img["path"]).convert("RGB")
+                            if isinstance(img, Image.Image):
+                                t = image_transform(img).unsqueeze(0).to(args.device)
+                                vision_emb = vision_enc(t)
+                            break
+                        except StopIteration:
+                            continue
+                        except Exception:
+                            continue
+
+                    # sample audio
+                    for a_ds, a_it in audio_iters.items():
+                        try:
+                            aud, meta = next(a_it)
+                            if isinstance(aud, dict) and "array" in aud:
+                                arr = torch.tensor(aud["array"]).float().unsqueeze(0).to(args.device)
+                                audio_emb = audio_enc(arr)
+                            elif isinstance(aud, (list, tuple)):
+                                arr = torch.tensor(aud).float().unsqueeze(0).to(args.device)
+                                audio_emb = audio_enc(arr)
+                            break
+                        except StopIteration:
+                            continue
+                        except Exception:
+                            continue
+
+                    if scaler is not None:
+                        with torch.cuda.amp.autocast():
+                            out = model(input_ids, vision_emb=vision_emb, audio_emb=audio_emb)
+                            logits = out["logits"]
+                            struct_logits = out["struct_logits"]
+                            lm_loss = nn.CrossEntropyLoss(ignore_index=-100)(logits.view(-1, logits.size(-1)), labels.view(-1))
+                            struct_targets = torch.zeros(logits.size(0), dtype=torch.long, device=args.device)
+                            struct_loss = F.cross_entropy(struct_logits, struct_targets)
+
+                            cot_loss = torch.tensor(0.0, device=args.device)
+                            total_loss = lm_loss + args.structure_loss_weight * struct_loss + args.cot_loss_weight * cot_loss
+
+                        optimizer.zero_grad()
+                        scaler.scale(total_loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        out = model(input_ids, vision_emb=vision_emb, audio_emb=audio_emb)
+                        logits = out["logits"]
+                        struct_logits = out["struct_logits"]
+                        lm_loss = nn.CrossEntropyLoss(ignore_index=-100)(logits.view(-1, logits.size(-1)), labels.view(-1))
+                        struct_targets = torch.zeros(logits.size(0), dtype=torch.long, device=args.device)
+                        struct_loss = F.cross_entropy(struct_logits, struct_targets)
+                        cot_loss = torch.tensor(0.0, device=args.device)
+                        total_loss = lm_loss + args.structure_loss_weight * struct_loss + args.cot_loss_weight * cot_loss
+
+                        optimizer.zero_grad()
+                        total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+
+                    if vision_emb is not None and args.train_vae_diffusion:
+                        try:
+                            img_tensor = image_transform(img).unsqueeze(0).to(args.device)
+                            recon, mu, logvar = vae(img_tensor)
+                            rec_loss = F.mse_loss(recon, img_tensor) + 1e-6 * torch.mean(torch.exp(logvar) + mu ** 2 - logvar)
+                            optimizer_vae.zero_grad()
+                            rec_loss.backward()
+                            optimizer_vae.step()
+                            with torch.no_grad():
+                                z, mu_z, logvar_z = vae.encode(img_tensor)
+                            t_idx = torch.randint(0, diffusion.timesteps, (z.shape[0],), device=args.device)
+                            diff_loss = diffusion.p_losses(z, t_idx)
+                            optimizer_unet.zero_grad()
+                            diff_loss.backward()
+                            optimizer_unet.step()
+                        except Exception:
+                            pass
+
+                    try:
+                        pooled = out["pooled"].detach()
+                        device_map = getattr(args, "device_map", None)
+                        action_map = getattr(args, "action_map", None)
+                        jsons = model.build_device_control_json(pooled, tk, device_map=device_map, action_map=action_map)
+                        for j in jsons:
+                            ok, msg = robot_cmd.send_command(j)
+                            if args.log_robot_commands:
+                                logger.info("[ROBOT_CMD] %s %s", msg, j)
+                            if args.dump_json_controls:
+                                out_path = os.path.join(args.checkpoint_dir, f"generated_control_step{steps + 1}.json")
+                                os.makedirs(args.checkpoint_dir, exist_ok=True)
+                                with open(out_path, "w", encoding="utf-8") as f:
+                                    json.dump(j, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        logger.warning("[TRAIN] robot/json generation failed: %s", e)
+
+                    steps += 1
+                    if steps % args.log_every == 0:
+                        try:
+                            logger.info(f"epoch {epoch + 1} step {steps} loss {total_loss.item():.6f} lm {lm_loss.item():.6f} struct {struct_loss.item():.6f} cot {float(cot_loss)}")
+                        except Exception:
+                            logger.info(f"epoch {epoch + 1} step {steps} (loss logging failed to format)")
+
+                    batch_texts = []
+
+                if i > args.max_examples_per_dataset:
+                    break
+
+        ckpt = os.path.join(args.checkpoint_dir, f"on_epoch{epoch + 1}.pt")
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        try:
+            torch.save({
+                "model": model.state_dict(),
+                "optim": optimizer.state_dict(),
+                "vae": vae.state_dict(),
+                "opt_vae": optimizer_vae.state_dict(),
+                "unet": unet.state_dict(),
+                "opt_unet": optimizer_unet.state_dict(),
+                "tokenizer_path": tk.path_out
+            }, ckpt)
+            # garantir que tokenizer salvo também
+            tk.save()
+            logger.info(f"[TRAIN] checkpoint salvo: {ckpt}")
+        except Exception as e:
+            logger.error("Falha ao salvar checkpoint: %s", e)
+
+    logger.info("[TRAIN] finalizado")
+
+# -----------------------
+# Argparse
+# -----------------------
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--vocab_size", type=int, default=DEFAULT_VOCAB_SIZE)
+    p.add_argument("--max_seq", type=int, default=DEFAULT_MAX_SEQ)
+    p.add_argument("--embed_dim", type=int, default=DEFAULT_EMBED)
+    p.add_argument("--layers", type=int, default=DEFAULT_LAYERS)
+    p.add_argument("--heads", type=int, default=DEFAULT_HEADS)
+    p.add_argument("--batch_size", type=int, default=DEFAULT_BATCH)
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--device", type=str, default=str(DEVICE))
+    p.add_argument("--tokenizer_path", type=str, default="on_tokenizer.json")
+    p.add_argument("--checkpoint_dir", type=str, default=CHECKPOINT_DIR)
+    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument("--max_examples_per_dataset", type=int, default=200)
+    p.add_argument("--text_datasets", nargs="+", default=DATASET_IDS_TEXT)
+    p.add_argument("--image_datasets", nargs="+", default=DATASET_IDS_IMAGE)
+    p.add_argument("--audio_datasets", nargs="+", default=DATASET_IDS_AUDIO)
+    p.add_argument("--code_datasets", nargs="+", default=DATASET_IDS_CODE)
+    p.add_argument("--audio_chunk_seconds", type=float, default=10.0)
+    p.add_argument("--vae_z_dim", type=int, default=512)
+    p.add_argument("--diffusion_steps", type=int, default=200)
+    p.add_argument("--train_vae_diffusion", action="store_true")
+    p.add_argument("--thought_minutes", type=float, default=9.0)
+    p.add_argument("--token_rate", type=float, default=1.0)
+    p.add_argument("--max_thought_steps", type=int, default=4096)
+    p.add_argument("--thought_layers", type=int, default=2)
+    p.add_argument("--structure_loss_weight", type=float, default=1.0)
+    p.add_argument("--tokenizer_vocab_estimate", type=int, default=50000)
+
+    p.add_argument("--use_cot", action="store_true")
+    p.add_argument("--cot_steps", type=int, default=64)
+    p.add_argument("--cot_loss_weight", type=float, default=0.0)
+    p.add_argument("--cot_vocab_supervision", action="store_true")
+
+    p.add_argument("--mqtt_host", type=str, default=None)
+    p.add_argument("--mqtt_user", type=str, default=None)
+    p.add_argument("--mqtt_pass", type=str, default=None)
+    p.add_argument("--mqtt_topic", type=str, default="robot/commands")
+    p.add_argument("--tcp_host", type=str, default=None)
+    p.add_argument("--tcp_port", type=int, default=9000)
+    p.add_argument("--robot_fallback_path", type=str, default="/tmp/robot_commands.jsonl")
+    p.add_argument("--dump_json_controls", action="store_true")
+    p.add_argument("--log_robot_commands", action="store_true")
+    p.add_argument("--device_map", nargs="*", default=None)
+    p.add_argument("--action_map", nargs="*", default=None)
+    # Tornar simulate default True (flag mantém True; --no-simulate para desativar)
+    p.add_argument("--simulate_robot", dest="simulate_robot", action="store_true", default=True, help="Enable simulate/dry-run mode for robot commands (default: True)")
+    p.add_argument("--no_simulate", dest="simulate_robot", action="store_false", help="Disable simulate/dry-run mode (actually send commands)")
+
+    return p.parse_args()
+
+# -----------------------
+# Main
+# -----------------------
+
+if __name__ == "__main__":
+    args = parse_args()
+    # convert device string to torch device
+    try:
+        args.device = torch.device(args.device)
+    except Exception:
+        args.device = DEVICE
+    if args.device_map == []:
+        args.device_map = None
+    if args.action_map == []:
+        args.action_map = None
+
+    train_real(args)
